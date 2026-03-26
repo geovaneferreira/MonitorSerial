@@ -10,6 +10,22 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var serialService = SerialPortService()
 
+    enum LogInsertMode: String, CaseIterable, Identifiable {
+        case bottom
+        case top
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .bottom:
+                return "Novos embaixo"
+            case .top:
+                return "Novos no topo"
+            }
+        }
+    }
+
     @State private var selectedDisplayMode: PayloadDisplayMode = .hex
     @State private var selectedSendMode: PayloadDisplayMode = .ascii
     @State private var autoScroll = true
@@ -17,11 +33,14 @@ struct ContentView: View {
     @State private var showTimestamps = true
     @State private var showLineBoxes = true
     @State private var allowLogSelection = false
+    @State private var appendCRLFOnManualSend = false
+    @State private var logInsertMode: LogInsertMode = .bottom
     @State private var composerText = ""
     @State private var savedCommands: [SavedCommand] = SavedCommand.samples
     @State private var newCommandTitle = ""
     @State private var newCommandPayload = ""
     @State private var isCommandsPanelVisible = false
+    @State private var expandedCommandIDs: Set<UUID> = []
 
     var body: some View {
         HStack(spacing: 18) {
@@ -52,6 +71,11 @@ struct ContentView: View {
         }
         .onChange(of: savedCommands) { _, _ in
             persistSavedCommands()
+        }
+        .onChange(of: logInsertMode) { _, newValue in
+            if newValue == .top {
+                autoScroll = false
+            }
         }
         .alert("Erro na conexão serial", isPresented: Binding(
             get: { serialService.errorMessage != nil },
@@ -84,7 +108,31 @@ struct ContentView: View {
                                 HStack {
                                     Text(command.title)
                                         .font(.headline)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
                                     Spacer()
+                                    Button {
+                                        toggleCommandExpansion(command)
+                                    } label: {
+                                        Image(systemName: expandedCommandIDs.contains(command.id) ? "slider.horizontal.3" : "slider.horizontal.3")
+                                            .font(.caption.weight(.bold))
+                                            .foregroundStyle(Color.white.opacity(0.8))
+                                            .padding(8)
+                                            .background(Color.white.opacity(0.08), in: Circle())
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Button {
+                                        removeSavedCommand(command)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.caption.weight(.bold))
+                                            .foregroundStyle(Color.red.opacity(0.85))
+                                            .padding(8)
+                                            .background(Color.red.opacity(0.12), in: Circle())
+                                    }
+                                    .buttonStyle(.plain)
+
                                     Text(command.mode.label)
                                         .font(.caption.weight(.semibold))
                                         .foregroundStyle(.secondary)
@@ -96,10 +144,61 @@ struct ContentView: View {
                                 Text(command.payload)
                                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(2)
                                     .frame(maxWidth: .infinity, alignment: .leading)
 
+                                HStack(spacing: 8) {
+                                    compactInfoPill(title: "Rep", value: "\(command.repeatCount)x")
+                                    compactInfoPill(
+                                        title: "Int",
+                                        value: command.repeatCount > 1 ? "\(formattedInterval(command.intervalValue)) \(command.intervalUnit.label)" : "-"
+                                    )
+                                    Spacer()
+                                }
+
+                                if expandedCommandIDs.contains(command.id) {
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Text("Repetições")
+                                                .font(.caption.weight(.bold))
+                                                .foregroundStyle(.secondary)
+                                            Stepper(value: repeatCountBinding(for: command), in: 1...999) {
+                                                Text("\(command.repeatCount)x")
+                                                    .font(.caption.weight(.semibold))
+                                            }
+                                        }
+
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Text("Intervalo")
+                                                .font(.caption.weight(.bold))
+                                                .foregroundStyle(.secondary)
+                                            HStack(spacing: 8) {
+                                                TextField("0", value: intervalValueBinding(for: command), format: .number)
+                                                    .textFieldStyle(.plain)
+                                                    .padding(.horizontal, 10)
+                                                    .padding(.vertical, 8)
+                                                    .frame(width: 72)
+                                                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+
+                                                Picker("", selection: intervalUnitBinding(for: command)) {
+                                                    ForEach(CommandIntervalUnit.allCases) { unit in
+                                                        Text(unit.label == "ms" ? "milissegundos" : "segundos").tag(unit)
+                                                    }
+                                                }
+                                                .labelsHidden()
+                                                .pickerStyle(.menu)
+                                                .frame(maxWidth: .infinity)
+                                            }
+                                        }
+                                    }
+                                    .padding(12)
+                                    .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+                                }
+
                                 Button {
-                                    sendSavedCommand(command)
+                                    Task {
+                                        await sendSavedCommand(command)
+                                    }
                                 } label: {
                                     Label("Enviar", systemImage: "paperplane.fill")
                                         .frame(maxWidth: .infinity)
@@ -186,6 +285,7 @@ struct ContentView: View {
 
                     Toggle("Auto-scroll", isOn: $autoScroll)
                         .toggleStyle(.switch)
+                        .disabled(logInsertMode == .top)
                     Toggle("Linha a linha", isOn: $logByLine)
                         .toggleStyle(.switch)
                     Toggle("Timestamp", isOn: $showTimestamps)
@@ -305,16 +405,21 @@ struct ContentView: View {
                     .frame(minHeight: 72)
                     .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
 
-                Button {
-                    sendComposer()
-                } label: {
-                    Label("Enviar", systemImage: "paperplane.fill")
-                        .frame(width: 126)
-                        .frame(minHeight: 72)
+                VStack(spacing: 10) {
+                    Toggle("CR/LF", isOn: $appendCRLFOnManualSend)
+                        .toggleStyle(.switch)
+
+                    Button {
+                        sendComposer()
+                    } label: {
+                        Label("Enviar", systemImage: "paperplane.fill")
+                            .frame(width: 126)
+                            .frame(minHeight: 52)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color(red: 0.12, green: 0.72, blue: 0.46))
+                    .disabled(!serialService.isConnected || composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Color(red: 0.12, green: 0.72, blue: 0.46))
-                .disabled(!serialService.isConnected || composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
     }
@@ -335,6 +440,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        .disabled(serialService.isConnected)
                     }
 
                     settingRow(label: "Baudrate") {
@@ -344,6 +450,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        .disabled(serialService.isConnected)
                     }
 
                     settingRow(label: "Data bits") {
@@ -353,6 +460,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.segmented)
+                        .disabled(serialService.isConnected)
                     }
 
                     settingRow(label: "Paridade") {
@@ -362,6 +470,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        .disabled(serialService.isConnected)
                     }
 
                     settingRow(label: "Stop bits") {
@@ -371,6 +480,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.segmented)
+                        .disabled(serialService.isConnected)
                     }
 
                     settingRow(label: "Buffer limit") {
@@ -380,6 +490,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        .disabled(serialService.isConnected)
                     }
 
                     settingRow(label: "Linhas visíveis") {
@@ -390,6 +501,15 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.menu)
+                    }
+
+                    settingRow(label: "Ordem") {
+                        Picker("", selection: $logInsertMode) {
+                            ForEach(LogInsertMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
                     }
                 }
 
@@ -421,7 +541,11 @@ struct ContentView: View {
                         .font(.headline)
 
                     statusRow(title: "Porta ativa", value: serialService.activePortName ?? "Nenhuma")
-                    statusRow(title: "Estado", value: serialService.isConnected ? "Conectado" : "Desconectado")
+                    coloredStatusRow(
+                        title: "Estado",
+                        value: serialService.isConnected ? "Conectado" : "Desconectado",
+                        color: serialService.isConnected ? Color.green : Color.red
+                    )
                     statusRow(title: "Visualização", value: selectedDisplayMode.label)
                     statusRow(title: "Envio", value: selectedSendMode.label)
                     statusRow(title: "Buffer RX", value: "\(serialService.receiveBufferLimit) bytes")
@@ -436,14 +560,18 @@ struct ContentView: View {
     }
 
     private var renderedEntries: [SerialLogEntry] {
+        let visibleEntries: [SerialLogEntry]
+
         guard logByLine else {
             let merged = serialService.mergedEntries
             let count = min(serialService.visibleLineLimit, merged.count)
-            return Array(merged.suffix(count))
+            visibleEntries = Array(merged.suffix(count))
+            return orderedEntries(visibleEntries)
         }
         let entries = serialService.logEntries
         let count = min(serialService.visibleLineLimit, entries.count)
-        return Array(entries.suffix(count))
+        visibleEntries = Array(entries.suffix(count))
+        return orderedEntries(visibleEntries)
     }
 
     private var selectionLogText: String {
@@ -465,12 +593,21 @@ struct ContentView: View {
     private func sendComposer() {
         let payload = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !payload.isEmpty else { return }
-        serialService.send(payload, mode: selectedSendMode)
+        serialService.send(payload, mode: selectedSendMode, appendCRLF: appendCRLFOnManualSend)
         composerText = ""
     }
 
-    private func sendSavedCommand(_ command: SavedCommand) {
-        serialService.send(command.payload, mode: command.mode)
+    private func sendSavedCommand(_ command: SavedCommand) async {
+        for index in 0..<command.repeatCount {
+            serialService.send(command.payload, mode: command.mode)
+
+            guard index < command.repeatCount - 1 else { continue }
+
+            let interval = clampedIntervalValue(command.intervalValue)
+            guard interval > 0 else { continue }
+            let sleepNs = UInt64(interval * Double(command.intervalUnit.nanosecondsMultiplier))
+            try? await Task.sleep(nanoseconds: sleepNs)
+        }
     }
 
     private func addSavedCommand() {
@@ -483,6 +620,81 @@ struct ContentView: View {
         savedCommands.append(SavedCommand(title: title, payload: payload, mode: inferredMode))
         newCommandTitle = ""
         newCommandPayload = ""
+    }
+
+    private func removeSavedCommand(_ command: SavedCommand) {
+        savedCommands.removeAll { $0.id == command.id }
+        expandedCommandIDs.remove(command.id)
+    }
+
+    private func toggleCommandExpansion(_ command: SavedCommand) {
+        if expandedCommandIDs.contains(command.id) {
+            expandedCommandIDs.remove(command.id)
+        } else {
+            expandedCommandIDs.insert(command.id)
+        }
+    }
+
+    private func repeatCountBinding(for command: SavedCommand) -> Binding<Int> {
+        Binding(
+            get: { savedCommands.first(where: { $0.id == command.id })?.repeatCount ?? 1 },
+            set: { newValue in
+                updateSavedCommand(command.id) { current in
+                    SavedCommand(
+                        id: current.id,
+                        title: current.title,
+                        payload: current.payload,
+                        mode: current.mode,
+                        repeatCount: max(1, newValue),
+                        intervalValue: current.intervalValue,
+                        intervalUnit: current.intervalUnit
+                    )
+                }
+            }
+        )
+    }
+
+    private func intervalValueBinding(for command: SavedCommand) -> Binding<Double> {
+        Binding(
+            get: { savedCommands.first(where: { $0.id == command.id })?.intervalValue ?? 0 },
+            set: { newValue in
+                updateSavedCommand(command.id) { current in
+                    SavedCommand(
+                        id: current.id,
+                        title: current.title,
+                        payload: current.payload,
+                        mode: current.mode,
+                        repeatCount: current.repeatCount,
+                        intervalValue: clampedIntervalValue(newValue),
+                        intervalUnit: current.intervalUnit
+                    )
+                }
+            }
+        )
+    }
+
+    private func intervalUnitBinding(for command: SavedCommand) -> Binding<CommandIntervalUnit> {
+        Binding(
+            get: { savedCommands.first(where: { $0.id == command.id })?.intervalUnit ?? .milliseconds },
+            set: { newValue in
+                updateSavedCommand(command.id) { current in
+                    SavedCommand(
+                        id: current.id,
+                        title: current.title,
+                        payload: current.payload,
+                        mode: current.mode,
+                        repeatCount: current.repeatCount,
+                        intervalValue: current.intervalValue,
+                        intervalUnit: newValue
+                    )
+                }
+            }
+        )
+    }
+
+    private func updateSavedCommand(_ id: UUID, transform: (SavedCommand) -> SavedCommand) {
+        guard let index = savedCommands.firstIndex(where: { $0.id == id }) else { return }
+        savedCommands[index] = transform(savedCommands[index])
     }
 
     private func loadSavedCommands() {
@@ -524,8 +736,26 @@ struct ContentView: View {
     }
 
     private func scrollLogToBottom(with proxy: ScrollViewProxy) {
-        guard autoScroll else { return }
+        guard autoScroll, logInsertMode == .bottom else { return }
         proxy.scrollTo("log-bottom", anchor: .bottom)
+    }
+
+    private func orderedEntries(_ entries: [SerialLogEntry]) -> [SerialLogEntry] {
+        if logInsertMode == .top {
+            return Array(entries.reversed())
+        }
+        return entries
+    }
+
+    private func clampedIntervalValue(_ value: Double) -> Double {
+        max(0, value)
+    }
+
+    private func formattedInterval(_ value: Double) -> String {
+        if value == floor(value) {
+            return String(Int(value))
+        }
+        return String(format: "%.2f", value)
     }
 
     private func panelCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
@@ -564,6 +794,19 @@ struct ContentView: View {
         .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 16))
     }
 
+    private func compactInfoPill(title: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .foregroundStyle(.primary)
+        }
+        .font(.caption2.weight(.bold))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.white.opacity(0.06), in: Capsule())
+    }
+
     private func segmentedButton(title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
@@ -597,6 +840,19 @@ struct ContentView: View {
             Spacer()
             Text(value)
                 .fontWeight(.semibold)
+        }
+        .font(.subheadline)
+        .padding(.vertical, 4)
+    }
+
+    private func coloredStatusRow(title: String, value: String, color: Color) -> some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .fontWeight(.bold)
+                .foregroundStyle(color)
         }
         .font(.subheadline)
         .padding(.vertical, 4)

@@ -34,6 +34,31 @@ enum PayloadDisplayMode: String, CaseIterable, Identifiable, Codable, Equatable 
     }
 }
 
+enum CommandIntervalUnit: String, CaseIterable, Identifiable, Codable, Equatable {
+    case milliseconds
+    case seconds
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .milliseconds:
+            return "ms"
+        case .seconds:
+            return "s"
+        }
+    }
+
+    var nanosecondsMultiplier: UInt64 {
+        switch self {
+        case .milliseconds:
+            return 1_000_000
+        case .seconds:
+            return 1_000_000_000
+        }
+    }
+}
+
 enum SerialParity: String, CaseIterable, Identifiable {
     case none
     case even
@@ -115,12 +140,47 @@ struct SavedCommand: Identifiable, Codable, Equatable {
     let title: String
     let payload: String
     let mode: PayloadDisplayMode
+    let repeatCount: Int
+    let intervalValue: Double
+    let intervalUnit: CommandIntervalUnit
 
-    init(id: UUID = UUID(), title: String, payload: String, mode: PayloadDisplayMode) {
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case payload
+        case mode
+        case repeatCount
+        case intervalValue
+        case intervalUnit
+    }
+
+    init(
+        id: UUID = UUID(),
+        title: String,
+        payload: String,
+        mode: PayloadDisplayMode,
+        repeatCount: Int = 1,
+        intervalValue: Double = 0,
+        intervalUnit: CommandIntervalUnit = .milliseconds
+    ) {
         self.id = id
         self.title = title
         self.payload = payload
         self.mode = mode
+        self.repeatCount = repeatCount
+        self.intervalValue = intervalValue
+        self.intervalUnit = intervalUnit
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try container.decode(String.self, forKey: .title)
+        payload = try container.decode(String.self, forKey: .payload)
+        mode = try container.decode(PayloadDisplayMode.self, forKey: .mode)
+        repeatCount = try container.decodeIfPresent(Int.self, forKey: .repeatCount) ?? 1
+        intervalValue = try container.decodeIfPresent(Double.self, forKey: .intervalValue) ?? 0
+        intervalUnit = try container.decodeIfPresent(CommandIntervalUnit.self, forKey: .intervalUnit) ?? .milliseconds
     }
 
     static let samples: [SavedCommand] = [
@@ -251,7 +311,7 @@ final class SerialPortService: ObservableObject {
         activePortName = nil
     }
 
-    func send(_ payload: String, mode: PayloadDisplayMode) {
+    func send(_ payload: String, mode: PayloadDisplayMode, appendCRLF: Bool = false) {
         guard fileDescriptor >= 0 else {
             errorMessage = "Abra a conexão antes de enviar comandos."
             return
@@ -260,9 +320,11 @@ final class SerialPortService: ObservableObject {
         let bytesToSend: Data
         switch mode {
         case .ascii:
-            bytesToSend = Data(payload.utf8)
+            let finalPayload = appendCRLF ? payload + "\r\n" : payload
+            bytesToSend = Data(finalPayload.utf8)
         case .hex:
-            guard let decoded = Self.decodeHexString(payload) else {
+            let finalPayload = appendCRLF ? payload + " 0D 0A" : payload
+            guard let decoded = Self.decodeHexString(finalPayload) else {
                 errorMessage = "Payload HEX inválido. Use pares como 7E 01 0A."
                 return
             }
