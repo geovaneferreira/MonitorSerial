@@ -9,6 +9,12 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var serialService = SerialPortService()
+    private static let logTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
 
     enum LogInsertMode: String, CaseIterable, Identifiable {
         case bottom
@@ -328,10 +334,10 @@ struct ContentView: View {
                         ForEach(renderedEntries) { entry in
                             HStack(alignment: .firstTextBaseline, spacing: 12) {
                                 if showTimestamps {
-                                    Text(entry.timestamp.formatted(date: .omitted, time: .standard))
+                                    Text(Self.logTimestampFormatter.string(from: entry.timestamp))
                                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                         .foregroundStyle(Color(red: 0.33, green: 0.73, blue: 0.93))
-                                        .frame(width: 90, alignment: .leading)
+                                        .frame(width: 108, alignment: .leading)
                                 }
 
                                 Text(entry.direction.symbol)
@@ -579,7 +585,7 @@ struct ContentView: View {
             var components: [String] = []
 
             if showTimestamps {
-                components.append(entry.timestamp.formatted(date: .omitted, time: .standard))
+                components.append(Self.logTimestampFormatter.string(from: entry.timestamp))
             }
 
             components.append(entry.direction.symbol)
