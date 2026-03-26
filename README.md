@@ -37,3 +37,4 @@ Painel lateral com comandos rápidos recolhível:
 - Os comandos rápidos são salvos localmente e recarregados ao abrir o app.
 - O projeto foi pensado para macOS.
 - Para acesso serial, o comportamento pode variar conforme permissões e configuração local do sistema.
+- O instalável está em `MonitorSerial 2026-03-26 10-59-20`; basta mover para a pasta `Aplicativos` do macOS.
