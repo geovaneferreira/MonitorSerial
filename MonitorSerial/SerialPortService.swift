@@ -133,7 +133,9 @@ struct SavedCommand: Identifiable, Codable, Equatable {
 @MainActor
 final class SerialPortService: ObservableObject {
     static let supportedBaudRates = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400]
-    private static let maxLogEntries = 1500
+    static let supportedBufferLimits = [150, 256, 512, 1024, 2048, 4096]
+    static let absoluteMaxLogEntries = 1500
+    static let supportedVisibleLineLimits = [10, 25, 50, 100, 150, 200, 300, 500, 750, 1000, 1500]
 
     @Published var availablePorts: [SerialPortDescriptor] = []
     @Published var selectedPortPath: String?
@@ -147,6 +149,9 @@ final class SerialPortService: ObservableObject {
     @Published var activePortName: String?
     @Published var totalReceivedBytes = 0
     @Published var totalSentBytes = 0
+    @Published var droppedIncomingBytes = 0
+    @Published var receiveBufferLimit = 1024
+    @Published var visibleLineLimit = 300
 
     private var fileDescriptor: Int32 = -1
     private var readSource: DispatchSourceRead?
@@ -277,6 +282,7 @@ final class SerialPortService: ObservableObject {
         logEntries.removeAll()
         totalReceivedBytes = 0
         totalSentBytes = 0
+        droppedIncomingBytes = 0
         pendingIncomingData.removeAll(keepingCapacity: false)
     }
 
@@ -391,6 +397,21 @@ final class SerialPortService: ObservableObject {
     }
 
     private func enqueueIncoming(_ data: Data) {
+        guard data.count <= receiveBufferLimit else {
+            droppedIncomingBytes += data.count
+            appendEvent("Pacote RX descartado: \(data.count) bytes acima do limite de \(receiveBufferLimit)")
+            return
+        }
+
+        if pendingIncomingData.count + data.count > receiveBufferLimit {
+            droppedIncomingBytes += pendingIncomingData.count + data.count
+            pendingIncomingData.removeAll(keepingCapacity: true)
+            pendingFlushTask?.cancel()
+            pendingFlushTask = nil
+            appendEvent("Buffer RX descartado: excedeu o limite de \(receiveBufferLimit) bytes")
+            return
+        }
+
         pendingIncomingData.append(data)
 
         guard pendingFlushTask == nil else { return }
@@ -414,8 +435,8 @@ final class SerialPortService: ObservableObject {
     private func appendLogEntry(_ entry: SerialLogEntry) {
         logEntries.append(entry)
 
-        if logEntries.count > Self.maxLogEntries {
-            logEntries.removeFirst(logEntries.count - Self.maxLogEntries)
+        if logEntries.count > Self.absoluteMaxLogEntries {
+            logEntries.removeFirst(logEntries.count - Self.absoluteMaxLogEntries)
         }
     }
 

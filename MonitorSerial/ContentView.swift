@@ -253,15 +253,21 @@ struct ContentView: View {
                     }
                     .padding(14)
                 }
+
+                Color.clear
+                    .frame(height: 1)
+                    .id("log-bottom")
             }
             .background(Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 24))
             .overlay(
                 RoundedRectangle(cornerRadius: 24)
                     .stroke(Color.white.opacity(0.06), lineWidth: 1)
             )
-            .onChange(of: renderedEntries.count) { _, _ in
-                guard autoScroll, let lastID = renderedEntries.last?.id else { return }
-                proxy.scrollTo(lastID, anchor: .bottom)
+            .onChange(of: serialService.totalReceivedBytes) { _, _ in
+                scrollLogToBottom(with: proxy)
+            }
+            .onChange(of: serialService.totalSentBytes) { _, _ in
+                scrollLogToBottom(with: proxy)
             }
         }
     }
@@ -366,6 +372,25 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                     }
+
+                    settingRow(label: "Buffer limit") {
+                        Picker("Buffer limit", selection: $serialService.receiveBufferLimit) {
+                            ForEach(SerialPortService.supportedBufferLimits, id: \.self) { limit in
+                                Text("\(limit) bytes").tag(limit)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
+                    settingRow(label: "Linhas visíveis") {
+                        Picker("Linhas visíveis", selection: $serialService.visibleLineLimit) {
+                            ForEach(SerialPortService.supportedVisibleLineLimits, id: \.self) { limit in
+                                let title = limit == SerialPortService.absoluteMaxLogEntries ? "MAX (\(limit))" : "\(limit)"
+                                Text(title).tag(limit)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
                 }
 
                 HStack(spacing: 10) {
@@ -399,6 +424,9 @@ struct ContentView: View {
                     statusRow(title: "Estado", value: serialService.isConnected ? "Conectado" : "Desconectado")
                     statusRow(title: "Visualização", value: selectedDisplayMode.label)
                     statusRow(title: "Envio", value: selectedSendMode.label)
+                    statusRow(title: "Buffer RX", value: "\(serialService.receiveBufferLimit) bytes")
+                    statusRow(title: "Linhas", value: "\(serialService.visibleLineLimit)")
+                    statusRow(title: "Descartado", value: "\(serialService.droppedIncomingBytes) bytes")
                 }
 
                 Spacer(minLength: 0)
@@ -409,9 +437,13 @@ struct ContentView: View {
 
     private var renderedEntries: [SerialLogEntry] {
         guard logByLine else {
-            return serialService.mergedEntries
+            let merged = serialService.mergedEntries
+            let count = min(serialService.visibleLineLimit, merged.count)
+            return Array(merged.suffix(count))
         }
-        return serialService.logEntries
+        let entries = serialService.logEntries
+        let count = min(serialService.visibleLineLimit, entries.count)
+        return Array(entries.suffix(count))
     }
 
     private var selectionLogText: String {
@@ -489,6 +521,11 @@ struct ContentView: View {
         } else {
             serialService.openConnection()
         }
+    }
+
+    private func scrollLogToBottom(with proxy: ScrollViewProxy) {
+        guard autoScroll else { return }
+        proxy.scrollTo("log-bottom", anchor: .bottom)
     }
 
     private func panelCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
