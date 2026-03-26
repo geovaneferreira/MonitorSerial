@@ -14,12 +14,6 @@ Monitor serial para macOS, feito em SwiftUI, com foco em leitura contínua de UA
 
 ## Capturas
 
-### Referência visual
-
-Imagem de referência do comportamento desejado:
-
-![Referência visual](docs/images/serial-port-utility-reference.png)
-
 ### Tela principal
 
 Visualização principal do monitor serial com painel de conexão, console central e envio manual:
