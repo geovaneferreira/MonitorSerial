@@ -7,14 +7,24 @@
 
 import SwiftUI
 
+private struct LogContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct LogViewportHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 struct ContentView: View {
     @StateObject private var serialService = SerialPortService()
-    private static let logTimestampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        return formatter
-    }()
 
     enum LogInsertMode: String, CaseIterable, Identifiable {
         case bottom
@@ -38,6 +48,7 @@ struct ContentView: View {
     @State private var logByLine = true
     @State private var showTimestamps = true
     @State private var showLineBoxes = true
+    @State private var wrapLogLines = true
     @State private var allowLogSelection = false
     @State private var appendCRLFOnManualSend = false
     @State private var logInsertMode: LogInsertMode = .bottom
@@ -47,6 +58,8 @@ struct ContentView: View {
     @State private var newCommandPayload = ""
     @State private var isCommandsPanelVisible = false
     @State private var expandedCommandIDs: Set<UUID> = []
+    @State private var logContentHeight: CGFloat = 0
+    @State private var logViewportHeight: CGFloat = 0
 
     var body: some View {
         HStack(spacing: 18) {
@@ -298,6 +311,8 @@ struct ContentView: View {
                         .toggleStyle(.switch)
                     Toggle("Boxes", isOn: $showLineBoxes)
                         .toggleStyle(.switch)
+                    Toggle("Quebra linha", isOn: $wrapLogLines)
+                        .toggleStyle(.switch)
                     Toggle("Seleção", isOn: $allowLogSelection)
                         .toggleStyle(.switch)
 
@@ -321,59 +336,89 @@ struct ContentView: View {
 
     private var logPanel: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                if allowLogSelection {
-                    Text(selectionLogText)
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.primary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
-                } else {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(renderedEntries) { entry in
-                            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                                if showTimestamps {
-                                    Text(Self.logTimestampFormatter.string(from: entry.timestamp))
-                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(Color(red: 0.33, green: 0.73, blue: 0.93))
-                                        .frame(width: 108, alignment: .leading)
+            GeometryReader { geometry in
+                ScrollView(logScrollAxes) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if allowLogSelection {
+                            Text(selectionLogText)
+                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
+                                .lineLimit(wrapLogLines ? nil : 1)
+                                .fixedSize(horizontal: !wrapLogLines, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: showLineBoxes ? 2 : 1) {
+                                ForEach(renderedEntries) { entry in
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        if showTimestamps {
+                                            Text(entry.timestampLabel)
+                                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                                .foregroundStyle(Color(red: 0.33, green: 0.73, blue: 0.93))
+                                                .frame(width: 108, alignment: .leading)
+                                        }
+
+                                        Text(entry.direction.symbol)
+                                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                                            .foregroundStyle(entry.direction.color)
+                                            .frame(width: 18)
+
+                                        Text(entry.payloadText(mode: selectedDisplayMode))
+                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                            .foregroundStyle(.primary)
+                                            .textSelection(.disabled)
+                                            .lineLimit(wrapLogLines ? nil : 1)
+                                            .fixedSize(horizontal: !wrapLogLines, vertical: wrapLogLines)
+                                            .frame(maxWidth: wrapLogLines ? .infinity : nil, alignment: .leading)
+                                    }
+                                    .padding(.horizontal, showLineBoxes ? 8 : 0)
+                                    .padding(.vertical, showLineBoxes ? 4 : 1)
+                                    .background(rowBackground)
+                                    .id(entry.id)
                                 }
-
-                                Text(entry.direction.symbol)
-                                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                                    .foregroundStyle(entry.direction.color)
-                                    .frame(width: 24)
-
-                                Text(entry.payloadText(mode: selectedDisplayMode))
-                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.primary)
-                                    .textSelection(.disabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(rowBackground)
-                            .id(entry.id)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
                         }
-                    }
-                    .padding(14)
-                }
 
-                Color.clear
-                    .frame(height: 1)
-                    .id("log-bottom")
-            }
-            .background(Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 24))
-            .overlay(
-                RoundedRectangle(cornerRadius: 24)
-                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
-            )
-            .onChange(of: serialService.totalReceivedBytes) { _, _ in
-                scrollLogToBottom(with: proxy)
-            }
-            .onChange(of: serialService.totalSentBytes) { _, _ in
-                scrollLogToBottom(with: proxy)
+                        Color.clear
+                            .frame(maxWidth: .infinity, minHeight: 8)
+                            .id("log-bottom")
+                    }
+                    .frame(
+                        minWidth: geometry.size.width,
+                        minHeight: geometry.size.height,
+                        alignment: .topLeading
+                    )
+                    .background(
+                        GeometryReader { contentGeometry in
+                            Color.clear
+                                .preference(key: LogContentHeightKey.self, value: contentGeometry.size.height)
+                        }
+                    )
+                }
+                .id(wrapLogLines)
+                .background(Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 24))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
+                .background(
+                    GeometryReader { viewportGeometry in
+                        Color.clear
+                            .preference(key: LogViewportHeightKey.self, value: viewportGeometry.size.height)
+                    }
+                )
+                .onPreferenceChange(LogContentHeightKey.self) { logContentHeight = $0 }
+                .onPreferenceChange(LogViewportHeightKey.self) { logViewportHeight = $0 }
+                .onChange(of: serialService.logUpdateID) { _, _ in
+                    scrollLogToBottom(with: proxy)
+                }
+                .onChange(of: logContentHeight) { _, _ in
+                    scrollLogToBottom(with: proxy)
+                }
             }
         }
     }
@@ -381,7 +426,7 @@ struct ContentView: View {
     @ViewBuilder
     private var rowBackground: some View {
         if showLineBoxes {
-            RoundedRectangle(cornerRadius: 16)
+            RoundedRectangle(cornerRadius: 10)
                 .fill(Color.white.opacity(0.04))
         } else {
             Rectangle()
@@ -569,15 +614,15 @@ struct ContentView: View {
         let visibleEntries: [SerialLogEntry]
 
         guard logByLine else {
-            let merged = serialService.mergedEntries
-            let count = min(serialService.visibleLineLimit, merged.count)
-            visibleEntries = Array(merged.suffix(count))
+            visibleEntries = serialService.visibleEntries(limit: serialService.visibleLineLimit, mergeAdjacent: true)
             return orderedEntries(visibleEntries)
         }
-        let entries = serialService.logEntries
-        let count = min(serialService.visibleLineLimit, entries.count)
-        visibleEntries = Array(entries.suffix(count))
+        visibleEntries = serialService.visibleEntries(limit: serialService.visibleLineLimit, mergeAdjacent: false)
         return orderedEntries(visibleEntries)
+    }
+
+    private var logScrollAxes: Axis.Set {
+        wrapLogLines ? .vertical : [.vertical, .horizontal]
     }
 
     private var selectionLogText: String {
@@ -585,7 +630,7 @@ struct ContentView: View {
             var components: [String] = []
 
             if showTimestamps {
-                components.append(Self.logTimestampFormatter.string(from: entry.timestamp))
+                components.append(entry.timestampLabel)
             }
 
             components.append(entry.direction.symbol)
@@ -743,7 +788,10 @@ struct ContentView: View {
 
     private func scrollLogToBottom(with proxy: ScrollViewProxy) {
         guard autoScroll, logInsertMode == .bottom else { return }
-        proxy.scrollTo("log-bottom", anchor: .bottom)
+        DispatchQueue.main.async {
+            let anchor = UnitPoint(x: 0, y: logContentHeight > logViewportHeight ? 1 : 0)
+            proxy.scrollTo("log-bottom", anchor: anchor)
+        }
     }
 
     private func orderedEntries(_ entries: [SerialLogEntry]) -> [SerialLogEntry] {

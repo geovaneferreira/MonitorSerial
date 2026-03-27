@@ -12,6 +12,8 @@ import IOKit
 import IOKit.serial
 import Darwin
 
+private let macOSCustomBaudRateRequest: UInt = 0x80045402
+
 struct SerialPortDescriptor: Identifiable, Hashable {
     let id = UUID()
     let path: String
@@ -107,31 +109,54 @@ enum SerialDirection: Equatable {
 }
 
 struct SerialLogEntry: Identifiable {
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
     let id = UUID()
     let timestamp: Date
     let direction: SerialDirection
     let bytes: Data
     let message: String?
+    let timestampLabel: String
+    private let asciiPayload: String
+    private let hexPayload: String
 
     init(timestamp: Date = .now, direction: SerialDirection, bytes: Data = Data(), message: String? = nil) {
         self.timestamp = timestamp
         self.direction = direction
         self.bytes = bytes
         self.message = message
+        timestampLabel = Self.timestampFormatter.string(from: timestamp)
+
+        if let message {
+            asciiPayload = message
+            hexPayload = message
+        } else {
+            let decoded = String(decoding: bytes, as: UTF8.self)
+            asciiPayload = decoded.isEmpty ? "<vazio>" : decoded.replacingOccurrences(of: "\0", with: "·")
+            hexPayload = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+        }
     }
 
     func payloadText(mode: PayloadDisplayMode) -> String {
-        if let message {
-            return message
-        }
-
         switch mode {
         case .ascii:
-            let decoded = String(decoding: bytes, as: UTF8.self)
-            return decoded.isEmpty ? "<vazio>" : decoded.replacingOccurrences(of: "\0", with: "·")
+            return asciiPayload
         case .hex:
-            return bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            return hexPayload
         }
+    }
+
+    func canMerge(with other: SerialLogEntry) -> Bool {
+        direction == other.direction && message == nil && other.message == nil
+    }
+
+    func prepending(_ older: SerialLogEntry) -> SerialLogEntry {
+        SerialLogEntry(timestamp: older.timestamp, direction: direction, bytes: older.bytes + bytes)
     }
 }
 
@@ -192,7 +217,7 @@ struct SavedCommand: Identifiable, Codable, Equatable {
 
 @MainActor
 final class SerialPortService: ObservableObject {
-    static let supportedBaudRates = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400]
+    static let supportedBaudRates = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 921600]
     static let supportedBufferLimits = [150, 256, 512, 1024, 2048, 4096]
     static let absoluteMaxLogEntries = 1500
     static let supportedVisibleLineLimits = [10, 25, 50, 100, 150, 200, 300, 500, 750, 1000, 1500]
@@ -212,6 +237,7 @@ final class SerialPortService: ObservableObject {
     @Published var droppedIncomingBytes = 0
     @Published var receiveBufferLimit = 1024
     @Published var visibleLineLimit = 300
+    @Published private(set) var logUpdateID = 0
 
     private var fileDescriptor: Int32 = -1
     private var readSource: DispatchSourceRead?
@@ -226,32 +252,37 @@ final class SerialPortService: ObservableObject {
         return "Pronto para conectar e monitorar a UART"
     }
 
-    var mergedEntries: [SerialLogEntry] {
-        guard !logEntries.isEmpty else { return [] }
+    func visibleEntries(limit: Int, mergeAdjacent: Bool) -> [SerialLogEntry] {
+        guard limit > 0, !logEntries.isEmpty else { return [] }
 
-        var merged: [SerialLogEntry] = []
+        if !mergeAdjacent {
+            return Array(logEntries.suffix(limit))
+        }
+
+        var mergedFromEnd: [SerialLogEntry] = []
         var pending: SerialLogEntry?
 
-        for entry in logEntries {
-            if let current = pending,
-               current.direction == entry.direction,
-               current.message == nil,
-               entry.message == nil {
-                let combined = current.bytes + entry.bytes
-                pending = SerialLogEntry(timestamp: current.timestamp, direction: current.direction, bytes: combined)
-            } else {
-                if let current = pending {
-                    merged.append(current)
-                }
-                pending = entry
+        for entry in logEntries.reversed() {
+            if let current = pending, current.canMerge(with: entry) {
+                pending = current.prepending(entry)
+                continue
             }
+
+            if let current = pending {
+                mergedFromEnd.append(current)
+                if mergedFromEnd.count == limit {
+                    break
+                }
+            }
+
+            pending = entry
         }
 
-        if let pending {
-            merged.append(pending)
+        if mergedFromEnd.count < limit, let pending {
+            mergedFromEnd.append(pending)
         }
 
-        return merged
+        return Array(mergedFromEnd.prefix(limit).reversed())
     }
 
     func refreshPorts() {
@@ -346,6 +377,7 @@ final class SerialPortService: ObservableObject {
         totalSentBytes = 0
         droppedIncomingBytes = 0
         pendingIncomingData.removeAll(keepingCapacity: false)
+        logUpdateID &+= 1
     }
 
     private func startReadLoop() {
@@ -424,6 +456,8 @@ final class SerialPortService: ObservableObject {
             throw SerialError.configuration("Não foi possível aplicar a configuração da porta.")
         }
 
+        try applyCustomBaudRateIfNeeded(descriptor)
+
         guard fcntl(descriptor, F_SETFL, 0) == 0 else {
             throw SerialError.configuration("Não foi possível colocar a porta em modo bloqueante.")
         }
@@ -449,8 +483,22 @@ final class SerialPortService: ObservableObject {
         case 57600: return speed_t(B57600)
         case 115200: return speed_t(B115200)
         case 230400: return speed_t(B230400)
+        case 921600: return speed_t(B38400)
         default:
             throw SerialError.configuration("Baudrate \(baudRate) não suportado nesta versão.")
+        }
+    }
+
+    private func applyCustomBaudRateIfNeeded(_ descriptor: Int32) throws {
+        guard selectedBaudRate == 921600 else { return }
+
+        var speed = speed_t(selectedBaudRate)
+        let result = withUnsafeMutablePointer(to: &speed) { pointer in
+            ioctl(descriptor, macOSCustomBaudRateRequest, pointer)
+        }
+
+        guard result == 0 else {
+            throw SerialError.configuration("Não foi possível aplicar o baudrate customizado de \(selectedBaudRate).")
         }
     }
 
@@ -500,6 +548,8 @@ final class SerialPortService: ObservableObject {
         if logEntries.count > Self.absoluteMaxLogEntries {
             logEntries.removeFirst(logEntries.count - Self.absoluteMaxLogEntries)
         }
+
+        logUpdateID &+= 1
     }
 
     private static func discoverSerialPorts() -> [SerialPortDescriptor] {
