@@ -458,6 +458,10 @@ final class SerialPortService: ObservableObject {
 
         try applyCustomBaudRateIfNeeded(descriptor)
 
+        guard tcflush(descriptor, TCIFLUSH) == 0 else {
+            throw SerialError.configuration("Não foi possível limpar o buffer de entrada da porta.")
+        }
+
         guard fcntl(descriptor, F_SETFL, 0) == 0 else {
             throw SerialError.configuration("Não foi possível colocar a porta em modo bloqueante.")
         }
