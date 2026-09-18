@@ -15,7 +15,7 @@ import Darwin
 private let macOSCustomBaudRateRequest: UInt = 0x80045402
 
 struct SerialPortDescriptor: Identifiable, Hashable {
-    let id = UUID()
+    var id: String { path }
     let path: String
     let displayName: String
 }
@@ -238,18 +238,32 @@ final class SerialPortService: ObservableObject {
     @Published var receiveBufferLimit = 1024
     @Published var visibleLineLimit = 300
     @Published private(set) var logUpdateID = 0
+    @Published private(set) var isModemBridgeRunning = false
+    @Published private(set) var isModemBridgeBusy = false
+    @Published private(set) var modemBridgeStatus = "Parado"
 
     private var fileDescriptor: Int32 = -1
     private var readSource: DispatchSourceRead?
+    private var directoryWatchers: [DispatchSourceFileSystemObject] = []
+    private var portRefreshTimer: Timer?
+    private var isMonitoringPorts = false
     private let ioQueue = DispatchQueue(label: "monitorserial.serial.io", qos: .userInitiated)
     private var pendingIncomingData = Data()
     private var pendingFlushTask: Task<Void, Never>?
+
+    init() {
+        startMonitoringPorts()
+    }
 
     var statusSummary: String {
         if isConnected {
             return "\(activePortName ?? "Porta serial") conectada em \(selectedBaudRate) bps"
         }
         return "Pronto para conectar e monitorar a UART"
+    }
+
+    var isModemScriptAvailable: Bool {
+        FileManager.default.isReadableFile(atPath: Self.modemStartScriptURL.path)
     }
 
     func visibleEntries(limit: Int, mergeAdjacent: Bool) -> [SerialLogEntry] {
@@ -285,12 +299,62 @@ final class SerialPortService: ObservableObject {
         return Array(mergedFromEnd.prefix(limit).reversed())
     }
 
+    func startMonitoringPorts() {
+        guard !isMonitoringPorts else {
+            refreshPorts()
+            return
+        }
+
+        isMonitoringPorts = true
+        refreshPorts()
+        startDirectoryWatchers()
+        startPeriodicRefresh()
+    }
+
     func refreshPorts() {
-        availablePorts = Self.discoverSerialPorts()
-        if selectedPortPath == nil {
-            selectedPortPath = availablePorts.first?.path
-        } else if !availablePorts.contains(where: { $0.path == selectedPortPath }) {
-            selectedPortPath = availablePorts.first?.path
+        var discovered = Self.discoverSerialPorts()
+        let previousSelection = selectedPortPath
+
+        if isConnected, let previousSelection, !discovered.contains(where: { $0.path == previousSelection }) {
+            discovered.insert(
+                SerialPortDescriptor(
+                    path: previousSelection,
+                    displayName: URL(fileURLWithPath: previousSelection).lastPathComponent
+                ),
+                at: 0
+            )
+        }
+
+        if availablePorts != discovered {
+            availablePorts = discovered
+        }
+
+        if isConnected, let previousSelection {
+            selectedPortPath = previousSelection
+            return
+        }
+
+        if previousSelection == nil || !discovered.contains(where: { $0.path == previousSelection }) {
+            selectedPortPath = discovered.first?.path
+        }
+
+        refreshModemBridgeStatus()
+    }
+
+    func startModemBridge() {
+        Task {
+            await runModemBridgeScript(Self.modemStartScriptURL, action: .start)
+        }
+    }
+
+    func stopModemBridge() {
+        if isConnected, selectedPortPath?.localizedCaseInsensitiveContains("qcserial") == true {
+            errorMessage = "Feche a conexão serial antes de parar o qcseriald."
+            return
+        }
+
+        Task {
+            await runModemBridgeScript(Self.modemStopScriptURL, action: .stop)
         }
     }
 
@@ -556,7 +620,227 @@ final class SerialPortService: ObservableObject {
         logUpdateID &+= 1
     }
 
+    private enum ModemBridgeAction {
+        case start
+        case stop
+
+        var busyLabel: String {
+            switch self {
+            case .start:
+                return "Iniciando..."
+            case .stop:
+                return "Parando..."
+            }
+        }
+
+        var eventVerb: String {
+            switch self {
+            case .start:
+                return "iniciar"
+            case .stop:
+                return "parar"
+            }
+        }
+    }
+
+    private func runModemBridgeScript(_ scriptURL: URL, action: ModemBridgeAction) async {
+        guard !isModemBridgeBusy else { return }
+
+        guard FileManager.default.isReadableFile(atPath: scriptURL.path) else {
+            errorMessage = "Script do qcseriald não encontrado em \(scriptURL.path)."
+            return
+        }
+
+        isModemBridgeBusy = true
+        modemBridgeStatus = action.busyLabel
+        appendEvent("Executando \(scriptURL.lastPathComponent) para \(action.eventVerb) as portas SIMCOM/Quectel...")
+
+        do {
+            let output = try await Self.runScriptWithAdministratorPrivileges(scriptURL)
+            let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedOutput.isEmpty {
+                appendEvent("\(scriptURL.lastPathComponent) concluído.")
+            } else {
+                appendEvent(trimmedOutput)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            appendEvent("Falha ao \(action.eventVerb) o qcseriald.")
+        }
+
+        isModemBridgeBusy = false
+        refreshPorts()
+    }
+
+    private func refreshModemBridgeStatus() {
+        let running = Self.isQcserialdProcessRunning() || Self.hasQcserialPorts()
+
+        if isModemBridgeRunning != running {
+            isModemBridgeRunning = running
+        }
+
+        guard !isModemBridgeBusy else { return }
+        modemBridgeStatus = running ? "Ativo" : "Parado"
+    }
+
+    private static func isQcserialdProcessRunning() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-qx", "qcseriald"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private static func hasQcserialPorts() -> Bool {
+        discoverFilesystemSerialPorts().contains { port in
+            port.path.localizedCaseInsensitiveContains("qcserial")
+        }
+    }
+
+    private static var modemScriptDirectory: URL {
+        let candidates = [
+            URL(fileURLWithPath: "/Users/geovaneferreira/Repositorios/GitHub_Geovane/qcseriald-darwin", isDirectory: true),
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Repositorios/GitHub_Geovane/qcseriald-darwin", isDirectory: true)
+        ]
+
+        return candidates.first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("iniciar.sh").path) }
+            ?? candidates[0]
+    }
+
+    private static var modemStartScriptURL: URL {
+        modemScriptDirectory.appendingPathComponent("iniciar.sh")
+    }
+
+    private static var modemStopScriptURL: URL {
+        modemScriptDirectory.appendingPathComponent("parar.sh")
+    }
+
+    private static func runScriptWithAdministratorPrivileges(_ scriptURL: URL) async throws -> String {
+        let quotedPath = "'" + scriptURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let appleScript = """
+        do shell script "bash \(quotedPath)" with administrator privileges with prompt "Monitor Serial precisa de administrador para criar as portas SIMCOM/Quectel no Mac."
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", appleScript]
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        return try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { finishedProcess in
+                let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                if finishedProcess.terminationStatus == 0 {
+                    continuation.resume(returning: output)
+                    return
+                }
+
+                let lowered = errorOutput.lowercased()
+                let message: String
+                if lowered.contains("canceled") || lowered.contains("cancelled") {
+                    message = "Autorização cancelada. As portas do modem não foram alteradas."
+                } else if errorOutput.isEmpty {
+                    message = "Falha ao executar \(scriptURL.lastPathComponent)."
+                } else {
+                    message = errorOutput
+                }
+
+                continuation.resume(throwing: SerialError.configuration(message))
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func startDirectoryWatchers() {
+        directoryWatchers.forEach { $0.cancel() }
+        directoryWatchers.removeAll()
+
+        for directory in Self.watchedPortDirectories {
+            let descriptor = open(directory, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .extend, .attrib, .link, .rename, .delete],
+                queue: .main
+            )
+            source.setEventHandler { [weak self] in
+                Task { @MainActor in
+                    self?.refreshPorts()
+                }
+            }
+            source.setCancelHandler {
+                close(descriptor)
+            }
+            source.resume()
+            directoryWatchers.append(source)
+        }
+    }
+
+    private func startPeriodicRefresh() {
+        portRefreshTimer?.invalidate()
+        portRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshPorts()
+            }
+        }
+    }
+
+    private static var homeDevDirectory: String {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("dev", isDirectory: true).path
+    }
+
+    private static var watchedPortDirectories: [String] {
+        [homeDevDirectory, "/dev"]
+    }
+
     private static func discoverSerialPorts() -> [SerialPortDescriptor] {
+        var portsByPath: [String: SerialPortDescriptor] = [:]
+
+        for port in discoverIOKitSerialPorts() {
+            portsByPath[port.path] = port
+        }
+
+        for port in discoverFilesystemSerialPorts() {
+            if portsByPath[port.path] == nil {
+                portsByPath[port.path] = port
+            }
+        }
+
+        return preferCalloutDevices(Array(portsByPath.values)).sorted { lhs, rhs in
+            let lhsPriority = portPriority(for: lhs)
+            let rhsPriority = portPriority(for: rhs)
+
+            if lhsPriority != rhsPriority {
+                return lhsPriority < rhsPriority
+            }
+
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private static func discoverIOKitSerialPorts() -> [SerialPortDescriptor] {
         guard let matching = IOServiceMatching(kIOSerialBSDServiceValue) else {
             return []
         }
@@ -590,31 +874,108 @@ final class SerialPortService: ObservableObject {
             }
         }
 
-        return ports.sorted { lhs, rhs in
-            let lhsPriority = portPriority(for: lhs)
-            let rhsPriority = portPriority(for: rhs)
+        return ports
+    }
 
-            if lhsPriority != rhsPriority {
-                return lhsPriority < rhsPriority
+    private static func discoverFilesystemSerialPorts() -> [SerialPortDescriptor] {
+        ports(in: homeDevDirectory, requireSerialName: false)
+            + ports(in: "/dev", requireSerialName: true)
+    }
+
+    private static func ports(in directory: String, requireSerialName: Bool) -> [SerialPortDescriptor] {
+        let fileManager = FileManager.default
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: directory) else {
+            return []
+        }
+
+        return entries.compactMap { name in
+            guard !name.hasPrefix(".") else { return nil }
+            if requireSerialName && !isSerialDeviceName(name) {
+                return nil
             }
 
-            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            let path = (directory as NSString).appendingPathComponent(name)
+            guard isUsableSerialPath(path) else {
+                return nil
+            }
+
+            return SerialPortDescriptor(path: path, displayName: displayName(forPath: path))
+        }
+    }
+
+    private static func displayName(forPath path: String) -> String {
+        let fileName = URL(fileURLWithPath: path).lastPathComponent
+        if path.hasPrefix(homeDevDirectory) {
+            return "\(fileName) (~/dev)"
+        }
+        return "\(fileName) (\(path))"
+    }
+
+    private static func isUsableSerialPath(_ path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return false }
+
+        let type = info.st_mode & S_IFMT
+        if type == S_IFCHR {
+            return true
+        }
+
+        guard type == S_IFLNK else { return false }
+
+        var target = stat()
+        return stat(path, &target) == 0 && (target.st_mode & S_IFMT) == S_IFCHR
+    }
+
+    private static func isSerialDeviceName(_ name: String) -> Bool {
+        let normalized = name.lowercased()
+        return normalized.hasPrefix("cu.")
+            || normalized.hasPrefix("tty.")
+            || normalized.hasPrefix("ttyusb")
+            || normalized.hasPrefix("ttyacm")
+            || normalized.contains("qcserial")
+            || normalized.contains("usbserial")
+            || normalized.contains("usbmodem")
+    }
+
+    private static func preferCalloutDevices(_ ports: [SerialPortDescriptor]) -> [SerialPortDescriptor] {
+        let paths = Set(ports.map(\.path))
+        return ports.filter { port in
+            let url = URL(fileURLWithPath: port.path)
+            let name = url.lastPathComponent
+            guard name.hasPrefix("tty.") else { return true }
+
+            let calloutPath = url
+                .deletingLastPathComponent()
+                .appendingPathComponent("cu." + name.dropFirst(4))
+                .path
+            return !paths.contains(calloutPath)
         }
     }
 
     private static func portPriority(for port: SerialPortDescriptor) -> Int {
-        let normalizedName = port.displayName.lowercased()
-        let normalizedPath = port.path.lowercased()
+        let normalized = "\(port.displayName) \(port.path)".lowercased()
 
-        if normalizedName.hasPrefix("usbserial") || normalizedName.contains(" usbserial") {
+        if normalized.contains("qcserial") && normalized.contains("at") {
             return 0
         }
 
-        if normalizedPath.contains("usbserial") {
-            return 0
+        if normalized.contains("qcserial") {
+            return 1
         }
 
-        return 1
+        if normalized.contains("usbserial") {
+            return 2
+        }
+
+        if normalized.contains("usbmodem") {
+            return 3
+        }
+
+        if normalized.contains("/dev") && !port.path.hasPrefix("/dev/") {
+            return 4
+        }
+
+        return 5
     }
 
     private static func decodeHexString(_ value: String) -> Data? {

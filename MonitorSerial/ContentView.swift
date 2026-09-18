@@ -85,7 +85,7 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: isCommandsPanelVisible)
         .onAppear {
-            serialService.refreshPorts()
+            serialService.startMonitoringPorts()
             loadSavedCommands()
         }
         .onChange(of: savedCommands) { _, _ in
@@ -477,6 +477,7 @@ struct ContentView: View {
 
     private var settingsSidebar: some View {
         panelCard {
+            ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 panelHeader(
                     title: "Conexão",
@@ -486,6 +487,10 @@ struct ContentView: View {
                 Group {
                     settingRow(label: "Porta") {
                         Picker("Porta", selection: $serialService.selectedPortPath) {
+                            if serialService.availablePorts.isEmpty {
+                                Text("Nenhuma porta encontrada").tag(nil as String?)
+                            }
+
                             ForEach(serialService.availablePorts) { port in
                                 Text(port.displayName).tag(port.path as String?)
                             }
@@ -588,6 +593,44 @@ struct ContentView: View {
                     .overlay(Color.white.opacity(0.08))
 
                 VStack(alignment: .leading, spacing: 10) {
+                    Text("Portas modem")
+                        .font(.headline)
+                    Text("Inicia o qcseriald para criar as portas SIMCOM, Quectel e outros no Mac.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 10) {
+                        Button {
+                            serialService.startModemBridge()
+                        } label: {
+                            Label("Iniciar", systemImage: "antenna.radiowaves.left.and.right")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color(red: 0.45, green: 0.38, blue: 0.92))
+                        .disabled(serialService.isModemBridgeBusy || !serialService.isModemScriptAvailable)
+
+                        Button {
+                            serialService.stopModemBridge()
+                        } label: {
+                            Label("Parar", systemImage: "stop.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(serialService.isModemBridgeBusy || !serialService.isModemScriptAvailable)
+                    }
+
+                    coloredStatusRow(
+                        title: "qcseriald",
+                        value: serialService.modemBridgeStatus,
+                        color: serialService.isModemBridgeRunning ? Color.green : Color.secondary
+                    )
+                }
+
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+
+                VStack(alignment: .leading, spacing: 10) {
                     Text("Sessão")
                         .font(.headline)
 
@@ -604,7 +647,7 @@ struct ContentView: View {
                     statusRow(title: "Descartado", value: "\(serialService.droppedIncomingBytes) bytes")
                 }
 
-                Spacer(minLength: 0)
+            }
             }
         }
         .frame(width: 320)
